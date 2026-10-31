@@ -7,18 +7,17 @@
 #include <vector>
 
 // --- PIN DEFINITIONS ---
-#define PIN_PWR_EN        14
-#define PIN_BTN_PWR_NEXT  15
-#define PIN_BTN_RESTART   21
+#define PIN_BTN_CONTROL   15
+#define PIN_POT_VOL       26  //ADC0
 
 #define SD_CS             13
 #define SD_SCK            10
 #define SD_MOSI           11
 #define SD_MISO           12
 
-#define I2S_LRC           26
-#define I2S_BCLK          27
-#define I2S_DIN           28
+#define I2S_LRC           7
+#define I2S_BCLK          6
+#define I2S_DIN           8
 
 // --- GLOBAL HARDWARE OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
@@ -31,11 +30,65 @@ int currentVideoIndex = 0;
 volatile bool nextRequested = false;
 volatile bool restartRequested = false;
 volatile bool isPlaying = false;
+volatile float volumeGain = 1.0f; // Range: 0.0f (mute) to 1.0f (max volume)
 
 File videoFile;
 
+// --- RANDOM EPISODE SELECTION ---
+int getRandomVideoIndex(int currentIndex) {
+  if (videoFiles.size() <= 1) return 0;
+
+  int newIndex = currentIndex;
+  // Ensure the next randomly selected episode is not the current one
+  while (newIndex == currentIndex) {
+    newIndex = rp2040.hwrand32() % videoFiles.size();
+  }
+  return newIndex;
+}
+
+// --- JPEGDEC CALLBACK FUNCTIONS FOR SD CARD STREAMING ---
+void *jpegOpen(const char *filename, int32_t *size) {
+  videoFile = SD.open(filename, FILE_READ);
+  if (videoFile) {
+    *size = videoFile.size();
+    return &videoFile;
+  }
+  return NULL;
+}
+
+void jpegClose(void *handle) {
+  File *f = (File *)handle;
+  if (f && *f) {
+    f->close();
+  }
+}
+
+int32_t jpegRead(JPEGFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+  File *f = (File *)pFile->fHandle;
+  if (f && *f) {
+    return f->read(pBuf, iLen);
+  }
+  return 0;
+}
+
+int32_t jpegSeek(JPEGFILE *pFile, int32_t iPosition) {
+  File *f = (File *)pFile->fHandle;
+  if (f && *f) {
+    if (f->seek(iPosition)) {
+      return iPosition;
+    }
+  }
+  return 0;
+}
+
+int drawJPEGCallback(JPEGDRAW *pDraw) {
+  tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  return 1;
+}
+
 // --- HELPER FUNCTIONS ---
 void scanSDCard() {
+  videoFiles.clear();
   File root = SD.open("/");
   while (File entry = root.openNextFile()) {
     if (!entry.isDirectory()) {
@@ -49,38 +102,43 @@ void scanSDCard() {
   root.close();
 }
 
-int drawJPEGCallback(JPEGDRAW *pDraw) {
-  tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
-  return 1;
+// Audio Volume Scaling Helper
+void writeAudioWithVolume(int16_t *buffer, size_t sampleCount) {
+  for (size_t i = 0; i < sampleCount; i++) {
+    buffer[i] = (int16_t)(buffer[i] * volumeGain);
+  }
+  i2sOutput.write((uint8_t*)buffer, sampleCount * sizeof(int16_t));
 }
 
 // ================================================================================
-// CORE 0: POWER LATCH, BUTTON SENSING, FILE SYSTEM, & AUDIO PROCESSING
+// CORE 0: BUTTON SENSING, VOLUME ADC, FILE SYSTEM, & AUDIO PROCESSING
 // ================================================================================
 void setup() {
-  // 1. Immediately driver Power Hold pin HIGH to latch system power
-  pinMode(PIN_PWR_EN, OUTPUT);
-  digitalWrite(PIN_PWR_EN, HIGH);
-
-  pinMode(PIN_BTN_PWR_NEXT, INPUT);
-  pinMode(PIN_BTN_RESTART, INPUT_PULLUP);
+  pinMode(PIN_BTN_CONTROL, INPUT_PULLUP);
+  analogReadResolution(10); // Standard 0-1023 ADC Scale
 
   Serial.begin(115200);
 
-  // 2. Initialize SPI1 for SD Card
+  // Initialize SPI1 for SD Card
   SPI1.setSCK(SD_SCK);
   SPI1.setTX(SD_MOSI);
   SPI1.setRX(SD_MISO);
   SPI1.begin();
 
-  if (!SD.begin(SD_CS, SPI1, 25000000)) {
+  // Earle Philhower RP2040 core method for initializing SD over SPI1
+  if (!SD.begin(SD_CS, SPI1)) {
     Serial.println("SD Card Initialization Failed!");
     return;
   }
 
   scanSDCard();
 
-  // 3. Initialize I2S Audio
+  // Pick a random episode index to play
+  if (!videoFiles.empty()) {
+    currentVideoIndex = rp2040.hwrand32() % videoFiles.size();
+  }
+
+  // Initialize I2S Audio
   i2sOutput.setBCLK(I2S_BCLK);
   i2sOutput.setDATA(I2S_DIN);
   i2sOutput.setBitsPerSample(16);
@@ -88,35 +146,54 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long btnPressStart = 0;
-  static bool btnWasPressed = false;
+  // 1. Single Button Next Track/Restart Track Logic
+  static bool lastBtnState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  static unsigned long lastBtnPresstime = 0;
+  static int btnClickCount = 0;
 
-  // --- Switch 1: Power Off (3s Hold) / Next Video (Short Press) ---
-  bool pwrBtnState = (digitalRead(PIN_BTN_PWR_NEXT) == HIGH);
+  bool currentBtnState = digitalRead(PIN_BTN_CONTROL);
 
-  if (pwrBtnState && !btnWasPressed) {
-    btnWasPressed = true;
-    btnPressStart = millis();
-  } else if (pwrBtnState && btnWasPressed) {
-    if (millis() - btnPressStart >= 3000) {
-      // Shut Down: Release Power Latch
-      digitalWrite(PIN_PWR_EN, LOW);
-      while (true) { delay(100); } // Wait for power rail to collapse
+  // Debounce the button transition
+  if (currentBtnState != lastBtnState) {
+    if (millis() - lastDebounceTime > 40) { //40MS debounce
+      lastDebounceTime = millis();
+
+      if (lastBtnState == HIGH && currentBtnState == LOW) {
+        unsigned long now = millis();
+        if (now - lastBtnPresstime < 750) {
+          btnClickCount++;
+        } else {
+          btnClickCount = 1;
+        }
+        lastBtnPresstime = now;
+
+        // Immediate restart trigger on 2nd tap within 750ms
+        if (btnClickCount == 2) {
+          restartRequested = true;
+          btnClickCount = 0;
+        }
+      }
     }
-  } else if (!pwrBtnState && btnWasPressed) {
-    btnWasPressed = false;
-    if (millis() - btnPressStart < 3000) {
-      nextRequested = true;
-    }
+    lastBtnState = currentBtnState;
   }
 
-  // --- Switch 2: Restart Video ---
-  if (digitalRead(PIN_BTN_RESTART) == LOW) {
-    restartRequested = true;
-    delay(150); // Basic debounce delay
+  // Timeout check for a single button press
+  if (btnClickCount == 1 && (millis() - lastBtnPresstime >= 750)) {
+    nextRequested = true;
+    btnClickCount = 0;
   }
 
-  delay(10);
+  // Analog Volume Pot Sampling
+  static unsigned long lastVolReadTime = 0;
+  if (millis() - lastVolReadTime >= 50) {
+    lastVolReadTime = millis();
+
+    int rawAdc = analogRead(PIN_POT_VOL); //Read 0 to 1023 from ADC
+    volumeGain = (float)rawAdc / 1023.0f; //Scale reading
+  }
+
+delay(5);
 }
 
 // ================================================================================
@@ -134,9 +211,10 @@ void loop1() {
     return;
   }
 
+  // Handle user-requested skip to next random episode
   if (nextRequested) {
     nextRequested = false;
-    currentVideoIndex = (currentVideoIndex + 1) % videoFiles.size();
+    currentVideoIndex = getRandomVideoIndex(currentVideoIndex);
   }
 
   if (restartRequested) {
@@ -146,14 +224,14 @@ void loop1() {
   String currentPath = videoFiles[currentVideoIndex];
   isPlaying = true;
 
-  // Open file directly by path string
-  if (jpeg.open(currentPath.c_str(), drawJPEGCallback)) {
+  // Open file using SD I/O callbacks
+  if (jpeg.open(currentPath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, drawJPEGCallback)) {
     jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
 
-    // Decode frame
+    // Decode frame sequence
     while (isPlaying && !nextRequested && !restartRequested) {
       if (!jpeg.decode(0, 0, 0)) {
-        break; // End of file or frame decode finished
+        break; // End of file or decode complete
       }
     }
     jpeg.close();
@@ -161,6 +239,11 @@ void loop1() {
     Serial.println("Failed to open file via JPEGDEC");
     delay(100);
   }
-  
+
   isPlaying = false;
+
+  // Handle natural video end with new random episode
+  if (!nextRequested && !restartRequested) {
+    currentVideoIndex = getRandomVideoIndex(currentVideoIndex);
+  }
 }
