@@ -1,0 +1,1 @@
+New-Item -ItemType Directory -Force -Path "converted"; Get-ChildItem *.mkv | ForEach-Object { ffmpeg -i $_.FullName -vf "scale=160:128:force_original_aspect_ratio=decrease,pad=160:128:(ow-iw)/2:(oh-ih)/2" -r 24 -vcodec mjpeg -q:v 5 -acodec pcm_s16le -ar 22050 -ac 1 -sn ("converted\" + $_.BaseName + ".avi") }
